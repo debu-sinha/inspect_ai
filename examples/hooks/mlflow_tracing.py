@@ -72,6 +72,7 @@ class MlflowTracingHooks(Hooks):
         self._task_spans: dict[str, Any] = {}  # eval_id -> LiveSpan
         self._sample_spans: dict[str, Any] = {}  # sample_id -> LiveSpan
         self._inspect_spans: dict[str, Any] = {}  # inspect span_id -> LiveSpan
+        self._seen_events: dict[str, set[str]] = {}  # sample_id -> event uuids
 
     def enabled(self) -> bool:
         return (
@@ -187,6 +188,7 @@ class MlflowTracingHooks(Hooks):
             logger.debug("Failed to start sample span", exc_info=True)
 
     async def on_sample_end(self, data: SampleEnd) -> None:
+        self._seen_events.pop(data.sample_id, None)
         span = self._sample_spans.pop(data.sample_id, None)
         if span is None:
             return
@@ -217,11 +219,27 @@ class MlflowTracingHooks(Hooks):
             logger.debug("Failed to end sample span", exc_info=True)
 
     async def on_sample_event(self, data: SampleEvent) -> None:
+        """Create one span per sample event.
+
+        The transcript notifies subscribers again when a completed model
+        event gets its timing fields, so the same event can arrive here more
+        than once. Model and tool events are tracked by uuid per sample so
+        each call produces a single span. Pending events are filtered before
+        they reach hooks today, and the check keeps the trace right if that
+        changes.
+        """
         sample_span = self._sample_spans.get(data.sample_id)
         if sample_span is None:
             return
 
         event = data.event
+        if event.pending:
+            return
+        if isinstance(event, (ModelEvent, ToolEvent)) and event.uuid is not None:
+            seen = self._seen_events.setdefault(data.sample_id, set())
+            if event.uuid in seen:
+                return
+            seen.add(event.uuid)
 
         try:
             if isinstance(event, SpanBeginEvent):

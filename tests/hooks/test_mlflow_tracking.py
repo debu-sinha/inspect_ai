@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -580,6 +580,94 @@ async def test_event_counts_logged_on_task_end(mlflow_env):
 
         # Event counts cleaned up after task end
         assert "eval-001" not in hook._event_counts
+
+
+@pytest.mark.anyio
+async def test_sample_event_delivered_twice_counts_once(mlflow_env):
+    from inspect_ai.event._model import ModelEvent
+    from inspect_ai.model._generate_config import GenerateConfig
+    from inspect_ai.model._model_output import ModelOutput
+
+    hook = MlflowTrackingHooks()
+    spec = _make_eval_spec()
+
+    with patch.object(_mlflow_mod, "mlflow") as mock_mlflow:
+        mock_mlflow.start_run.return_value = MagicMock()
+
+        await hook.on_run_start(
+            RunStart(eval_set_id=None, run_id="run-001", task_names=["test_task"])
+        )
+        await hook.on_task_start(
+            TaskStart(
+                eval_set_id=None,
+                run_id="run-001",
+                eval_id="eval-001",
+                spec=spec,
+                plan=EvalPlan(),
+            )
+        )
+
+        model_event = ModelEvent(
+            model="openai/gpt-4",
+            input=[],
+            tools=[],
+            tool_choice="auto",
+            config=GenerateConfig(),
+            output=ModelOutput(),
+        )
+
+        # The transcript notifies subscribers again once the timing fields of a
+        # completed model event are set, so the same event arrives twice.
+        for _ in range(2):
+            await hook.on_sample_event(
+                SampleEvent(
+                    eval_set_id=None,
+                    run_id="run-001",
+                    eval_id="eval-001",
+                    sample_id="sample-0",
+                    event=model_event,
+                )
+            )
+
+        pending_event = ModelEvent(
+            model="openai/gpt-4",
+            input=[],
+            tools=[],
+            tool_choice="auto",
+            config=GenerateConfig(),
+            output=ModelOutput(),
+            pending=True,
+        )
+        await hook.on_sample_event(
+            SampleEvent(
+                eval_set_id=None,
+                run_id="run-001",
+                eval_id="eval-001",
+                sample_id="sample-0",
+                event=pending_event,
+            )
+        )
+
+        assert hook._event_counts["eval-001"]["model_calls"] == 1
+        model_call_logs = [
+            c
+            for c in mock_mlflow.log_metric.call_args_list
+            if c.args[0] == "event/model_call"
+        ]
+        assert model_call_logs == [call("event/model_call", 0, step=0)]
+
+        await hook.on_sample_end(
+            SampleEnd(
+                eval_set_id=None,
+                run_id="run-001",
+                eval_id="eval-001",
+                sample_id="sample-0",
+                sample=_make_sample(),
+            )
+        )
+
+        # Per-sample dedup state is released when the sample ends
+        assert "sample-0" not in hook._seen_events
 
 
 @pytest.mark.anyio

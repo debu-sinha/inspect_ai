@@ -95,6 +95,7 @@ class MlflowTrackingHooks(Hooks):
         self._sample_counts: dict[str, int] = {}
         self._model_usage: dict[str, dict[str, float]] = {}
         self._event_counts: dict[str, dict[str, int]] = {}
+        self._seen_events: dict[str, set[str]] = {}
 
     def enabled(self) -> bool:
         return os.getenv("MLFLOW_TRACKING_URI") is not None
@@ -307,6 +308,7 @@ class MlflowTrackingHooks(Hooks):
             os.unlink(path)
 
     async def on_sample_end(self, data: SampleEnd) -> None:
+        self._seen_events.pop(data.sample_id, None)
         eval_id = data.eval_id
         if eval_id not in self._task_runs:
             return
@@ -341,15 +343,32 @@ class MlflowTrackingHooks(Hooks):
                 pass
 
     async def on_sample_event(self, data: SampleEvent) -> None:
+        """Log model and tool events, counting each event once.
+
+        The transcript notifies subscribers again when a completed model
+        event gets its timing fields, so the same event can arrive here more
+        than once. Events are tracked by uuid per sample so each model or
+        tool call is logged a single time. Pending events are filtered before
+        they reach hooks today, and the check keeps the counts right if that
+        changes.
+        """
         eval_id = data.eval_id
         if eval_id not in self._task_runs:
             return
+
+        event = data.event
+        if event.pending:
+            return
+        if isinstance(event, (ModelEvent, ToolEvent)) and event.uuid is not None:
+            seen = self._seen_events.setdefault(data.sample_id, set())
+            if event.uuid in seen:
+                return
+            seen.add(event.uuid)
 
         # Initialize per-task event counters
         if eval_id not in self._event_counts:
             self._event_counts[eval_id] = {"model_calls": 0, "tool_calls": 0}
 
-        event = data.event
         counters = self._event_counts[eval_id]
 
         if isinstance(event, ModelEvent):

@@ -987,3 +987,85 @@ async def test_model_event_with_cache_hit(tracing_env):
 
         model_call = mock_mlflow.start_span_no_context.call_args_list[3]
         assert model_call.kwargs["attributes"]["cache"] == "read"
+
+
+@pytest.mark.anyio
+async def test_model_event_delivered_twice_creates_one_span(tracing_env):
+    from inspect_ai.event._model import ModelEvent
+    from inspect_ai.model._generate_config import GenerateConfig
+    from inspect_ai.model._model_output import ModelOutput
+
+    hook = MlflowTracingHooks()
+    run_span = MagicMock()
+    task_span = MagicMock()
+    sample_span = MagicMock()
+    model_span = MagicMock()
+    spec = _make_eval_spec()
+
+    with patch.object(_tracing_mod, "mlflow") as mock_mlflow:
+        mock_mlflow.start_span_no_context.side_effect = [
+            run_span,
+            task_span,
+            sample_span,
+            model_span,
+        ]
+
+        await hook.on_run_start(
+            RunStart(eval_set_id=None, run_id="run-001", task_names=["t"])
+        )
+        await hook.on_task_start(
+            TaskStart(
+                eval_set_id=None,
+                run_id="run-001",
+                eval_id="eval-001",
+                spec=spec,
+                plan=EvalPlan(),
+            )
+        )
+        await hook.on_sample_start(
+            SampleStart(
+                eval_set_id=None,
+                run_id="run-001",
+                eval_id="eval-001",
+                sample_id="s-001",
+                summary=MagicMock(),
+            )
+        )
+
+        model_event = ModelEvent(
+            model="openai/gpt-4o",
+            input=[],
+            tools=[],
+            tool_choice="auto",
+            config=GenerateConfig(),
+            output=ModelOutput(),
+        )
+
+        # The transcript notifies subscribers again once the timing fields of a
+        # completed model event are set, so the same event arrives twice.
+        for _ in range(2):
+            await hook.on_sample_event(
+                SampleEvent(
+                    eval_set_id=None,
+                    run_id="run-001",
+                    eval_id="eval-001",
+                    sample_id="s-001",
+                    event=model_event,
+                )
+            )
+
+        assert mock_mlflow.start_span_no_context.call_count == 4
+        model_span.end.assert_called_once()
+
+        await hook.on_sample_end(
+            SampleEnd(
+                eval_set_id=None,
+                run_id="run-001",
+                eval_id="eval-001",
+                sample_id="s-001",
+                sample=_make_sample(),
+            )
+        )
+
+        # Per-sample dedup state is released when the sample ends
+        assert "s-001" not in hook._seen_events
